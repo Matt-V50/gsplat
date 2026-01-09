@@ -12,9 +12,9 @@ numpy<2.0.0
 scikit-learn
 tqdm
 torchmetrics[image]
-opencv-python
+opencv-python==4.10.0.84
 tyro>=0.8.8
-Pillow
+Pillow==11.0.0
 tensorboard
 tensorly
 pyyaml

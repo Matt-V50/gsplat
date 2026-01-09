@@ -132,7 +132,9 @@ class Parser:
             ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+            # Keep the same logic with vinilla GS, which use convert -resize in ImageMagick
+            # The resized image should use the rounded width and height
+            imsize_dict[camera_id] = (int(round(cam.width / factor)), int(round(cam.height / factor)))  # (cam.width / factor, cam.height / factor)
             mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
@@ -190,11 +192,11 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
-            image_dir = _resize_image_folder(
-                colmap_image_dir, image_dir + "_png", factor=factor
-            )
-            image_files = sorted(_get_rel_paths(image_dir))
+        # if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
+        #     image_dir = _resize_image_folder(
+        #         colmap_image_dir, image_dir + "_png", factor=factor
+        #     )
+        #     image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 

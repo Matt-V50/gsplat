@@ -39,6 +39,42 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+class Timer:
+    def __init__(self):
+        self._iter_start = torch.cuda.Event(enable_timing = True)
+        self._iter_end = torch.cuda.Event(enable_timing = True)
+        self._optim_start = torch.cuda.Event(enable_timing = True)
+        self._optim_end = torch.cuda.Event(enable_timing = True)
+        self.total_render_time = 0.0
+        self.total_optim_time = 0.0
+    
+    def iter_start(self):
+        self._iter_start.record()
+    
+    def iter_end(self):
+        self._iter_end.record()
+        torch.cuda.synchronize()
+        self.total_render_time += self._iter_start.elapsed_time(self._iter_end) / 1e3 # ms to s
+
+    def optim_start(self):
+        self._optim_start.record()
+
+    def optim_end(self):
+        self._optim_end.record()
+        torch.cuda.synchronize()
+        self.total_optim_time += self._optim_start.elapsed_time(self._optim_end) / 1e3 # ms to s
+        
+    @property
+    def total_times(self):
+        return self.total_render_time + self.total_optim_time
+
+    @property
+    def metrics(self):
+        return {
+            "train_times": self.total_times,
+            "train_render_times": self.total_render_time,
+            "train_optimal_times": self.total_optim_time
+        }
 
 @dataclass
 class Config:
@@ -178,7 +214,7 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
-    lpips_net: Literal["vgg", "alex"] = "alex"
+    lpips_net: Literal["vgg", "alex"] = "vgg"  # Original 3DGS uses vgg https://github.com/graphdeco-inria/gaussian-splatting/blob/54c035f7834b564019656c3e3fcc3646292f727d/metrics.py#L74
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
@@ -308,6 +344,7 @@ class Runner:
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
+        self.timer = Timer()
 
         self.cfg = cfg
         self.world_rank = world_rank
@@ -606,7 +643,7 @@ class Runner:
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
-
+            self.timer.iter_start()
             try:
                 data = next(trainloader_iter)
             except StopIteration:
@@ -715,7 +752,8 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            loss.backward()
+            loss.backward() 
+            self.timer.iter_end()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -839,7 +877,7 @@ class Runner:
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
-
+            self.timer.optim_start()
             # optimize
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
@@ -880,7 +918,7 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
+            self.timer.optim_end()
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -903,18 +941,26 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+        with open(os.path.join(self.stats_dir, "training_time.json"), 'w') as f:
+            json.dump(self.timer.metrics, f)
     @torch.no_grad()
-    def eval(self, step: int, stage: str = "val"):
+    def eval(self, step: int, stage: str = "val", save_images: bool = True):
         """Entry for evaluation."""
-        print("Running evaluation...")
+        print(f"Running evaluation: {stage} at step {step}")
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
 
-        valloader = torch.utils.data.DataLoader(
+        if stage == "val":
+            valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
+        elif stage == "train":
+            valloader = torch.utils.data.DataLoader(
+                self.trainset, batch_size=1, shuffle=False, num_workers=1
+            )
+        
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
@@ -944,12 +990,13 @@ class Runner:
 
             if world_rank == 0:
                 # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+                if save_images:
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                        canvas,
+                    )
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1166,20 +1213,32 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             print("Viewer is disabled in distributed training.")
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
+    
 
     if cfg.ckpt is not None:
         # run eval only
-        ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
-        for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
-        runner.eval(step=step)
-        runner.render_traj(step=step)
-        if cfg.compression is not None:
-            runner.run_compression(step=step)
+        # ckpts = [
+        #     torch.load(file, map_location=runner.device, weights_only=True)
+        #     for file in cfg.ckpt
+        # ]
+        # for k in runner.splats.keys():
+        #     runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        # step = ckpts[0]["step"]
+        # runner.eval(step=step)
+        # runner.render_traj(step=step)
+        # if cfg.compression is not None:
+        #     runner.run_compression(step=step)
+        
+        for file in cfg.ckpt:
+            ckpt = torch.load(os.path.join(cfg.result_dir, "ckpts", file), map_location=runner.device, weights_only=True)
+            for k in runner.splats.keys():
+                runner.splats[k].data = ckpt["splats"][k]
+            step = ckpt["step"]
+            runner.eval(step=step, stage="train", save_images=False)
+            runner.eval(step=step, stage="val", save_images=True)
+        # runner.render_traj(step=step)
+        # if cfg.compression is not None:
+        #     runner.run_compression(step=step)
     else:
         runner.train()
 
